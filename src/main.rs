@@ -257,13 +257,13 @@ fn parse_subprotocols(header_value: Option<&HeaderValue>) -> Vec<String> {
 async fn handle_live_transcription(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     println!("WebSocket upgrade request for: /api/live-transcription");
 
     // Extract and validate JWT from access_token.<jwt> subprotocol.
-    // Axum's WebSocketUpgrade parses Sec-WebSocket-Protocol into its protocols() list.
-    let protocols: Vec<String> = ws.protocols().map(|p| p.to_string()).collect();
+    let protocols = parse_subprotocols(headers.get("sec-websocket-protocol"));
     let valid_proto = match validate_ws_token(&protocols, &state.config.session_secret) {
         Some(proto) => proto,
         None => {
