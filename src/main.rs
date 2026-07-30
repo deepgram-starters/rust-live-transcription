@@ -23,6 +23,10 @@ use axum::response::{IntoResponse, Json};
 use axum::routing::get;
 use axum::Router;
 use chrono::Utc;
+use deepgram::{
+    common::options::{Encoding, Language, Model, Options},
+    Deepgram,
+};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
@@ -30,10 +34,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::Mutex;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite;
 use tower_http::cors::{Any, CorsLayer};
-use url::Url;
 
 // ============================================================================
 // CONFIGURATION
@@ -42,7 +43,6 @@ use url::Url;
 #[derive(Clone)]
 struct Config {
     deepgram_api_key: String,
-    deepgram_stt_url: String,
     port: u16,
     host: String,
     session_secret: Vec<u8>,
@@ -78,7 +78,6 @@ fn load_config() -> Config {
 
     Config {
         deepgram_api_key: api_key,
-        deepgram_stt_url: "wss://api.deepgram.com/v1/listen".to_string(),
         port,
         host,
         session_secret: secret,
@@ -214,28 +213,21 @@ async fn handle_health() -> impl IntoResponse {
 // WEBSOCKET PROXY
 // ============================================================================
 
-/// Builds the Deepgram WebSocket URL with query parameters forwarded from the client request.
-fn build_deepgram_url(base_url: &str, params: &HashMap<String, String>) -> String {
-    let mut url = Url::parse(base_url).expect("Invalid Deepgram base URL");
-
-    let defaults: Vec<(&str, &str)> = vec![
-        ("model", "nova-3"),
-        ("language", "en"),
-        ("smart_format", "true"),
-        ("punctuate", "true"),
-        ("diarize", "false"),
-        ("filler_words", "false"),
-        ("encoding", "linear16"),
-        ("sample_rate", "16000"),
-        ("channels", "1"),
-    ];
-
-    for (name, default_val) in &defaults {
-        let val = params.get(*name).map(|s| s.as_str()).unwrap_or(default_val);
-        url.query_pairs_mut().append_pair(name, val);
+/// Maps an encoding query-parameter string to the SDK's [`Encoding`] enum,
+/// falling back to a custom encoding for any value the SDK does not model.
+fn map_encoding(value: &str) -> Encoding {
+    match value {
+        "linear16" => Encoding::Linear16,
+        "linear32" => Encoding::Linear32,
+        "flac" => Encoding::Flac,
+        "mulaw" => Encoding::Mulaw,
+        "amr-nb" => Encoding::AmrNb,
+        "amr-wb" => Encoding::AmrWb,
+        "opus" => Encoding::Opus,
+        "speex" => Encoding::Speex,
+        "g729" => Encoding::G729,
+        other => Encoding::CustomEncoding(other.to_string()),
     }
-
-    url.to_string()
 }
 
 /// Parses WebSocket subprotocols from the Sec-WebSocket-Protocol header.
@@ -281,6 +273,15 @@ async fn handle_live_transcription(
 }
 
 /// Handles the bidirectional WebSocket proxy between client and Deepgram.
+///
+/// The Deepgram side is driven entirely by the official `deepgram` crate's
+/// live-transcription [`WebsocketHandle`](deepgram::listen::websocket). Audio
+/// frames arriving from the browser are forwarded to Deepgram via
+/// `send_data`, JSON control messages are mapped onto the handle's
+/// `keep_alive` / `finalize` / `close_stream` helpers, and typed
+/// [`StreamResponse`](deepgram::common::stream_response::StreamResponse)
+/// results coming back from Deepgram are re-serialized to JSON and forwarded
+/// to the browser unchanged in shape.
 async fn handle_ws_proxy(
     client_ws: WebSocket,
     state: Arc<AppState>,
@@ -298,53 +299,71 @@ async fn handle_ws_proxy(
         conns.push(client_sender.clone());
     }
 
-    // Build Deepgram URL with forwarded query parameters
-    let deepgram_url = build_deepgram_url(&state.config.deepgram_stt_url, &params);
-
-    let model = params.get("model").map(|s| s.as_str()).unwrap_or("nova-3");
-    let language = params.get("language").map(|s| s.as_str()).unwrap_or("en");
-    let encoding = params.get("encoding").map(|s| s.as_str()).unwrap_or("linear16");
-    let sample_rate = params
+    // Resolve transcription options from the forwarded query parameters,
+    // preserving the previous defaults.
+    let model = params
+        .get("model")
+        .cloned()
+        .unwrap_or_else(|| "nova-3".to_string());
+    let language = params
+        .get("language")
+        .cloned()
+        .unwrap_or_else(|| "en".to_string());
+    let encoding = params
+        .get("encoding")
+        .cloned()
+        .unwrap_or_else(|| "linear16".to_string());
+    let sample_rate: u32 = params
         .get("sample_rate")
-        .map(|s| s.as_str())
-        .unwrap_or("16000");
-    let channels = params.get("channels").map(|s| s.as_str()).unwrap_or("1");
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16000);
+    let channels: u16 = params
+        .get("channels")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let smart_format = params.get("smart_format").map(|s| s == "true").unwrap_or(true);
+    let punctuate = params.get("punctuate").map(|s| s == "true").unwrap_or(true);
+    let diarize = params.get("diarize").map(|s| s == "true").unwrap_or(false);
+    let filler_words = params.get("filler_words").map(|s| s == "true").unwrap_or(false);
 
     println!(
         "Connecting to Deepgram STT: model={}, language={}, encoding={}, sample_rate={}, channels={}",
         model, language, encoding, sample_rate, channels
     );
 
-    // Connect to Deepgram with API key auth
-    let mut request = tungstenite::http::Request::builder()
-        .uri(&deepgram_url)
-        .header("Authorization", format!("Token {}", state.config.deepgram_api_key))
-        .header("Host", "api.deepgram.com")
-        .header("Connection", "Upgrade")
-        .header("Upgrade", "websocket")
-        .header("Sec-WebSocket-Version", "13")
-        .header(
-            "Sec-WebSocket-Key",
-            tungstenite::handshake::client::generate_key(),
-        )
-        .body(())
-        .expect("Failed to build Deepgram WebSocket request");
+    let options = Options::builder()
+        .model(Model::from(model))
+        .language(Language::from(language))
+        .smart_format(smart_format)
+        .punctuate(punctuate)
+        .diarize(diarize)
+        .filler_words(filler_words)
+        .build();
 
-    // Workaround: tungstenite requires a valid URI
-    *request.uri_mut() = deepgram_url.parse().expect("Failed to parse Deepgram URL");
+    // Establish the Deepgram live-transcription websocket via the SDK.
+    let dg = match Deepgram::new(&state.config.deepgram_api_key) {
+        Ok(dg) => dg,
+        Err(e) => {
+            eprintln!("Failed to initialize Deepgram client: {e}");
+            close_client(&client_sender, 1011, "Failed to connect to Deepgram").await;
+            remove_connection(&state, &client_sender).await;
+            return;
+        }
+    };
 
-    let dg_conn = match connect_async(request).await {
-        Ok((ws_stream, _)) => ws_stream,
+    let mut dg_handle = match dg
+        .transcription()
+        .stream_request_with_options(options)
+        .encoding(map_encoding(&encoding))
+        .sample_rate(sample_rate)
+        .channels(channels)
+        .handle()
+        .await
+    {
+        Ok(handle) => handle,
         Err(e) => {
             eprintln!("Failed to connect to Deepgram: {e}");
-            let mut sender = client_sender.lock().await;
-            let _ = sender
-                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                    code: 1011,
-                    reason: "Failed to connect to Deepgram".into(),
-                })))
-                .await;
-            // Remove from active connections
+            close_client(&client_sender, 1011, "Failed to connect to Deepgram").await;
             remove_connection(&state, &client_sender).await;
             return;
         }
@@ -352,168 +371,126 @@ async fn handle_ws_proxy(
 
     println!("Connected to Deepgram STT API");
 
-    // Split Deepgram WebSocket into sender and receiver
-    let (dg_sender, mut dg_receiver) = dg_conn.split();
-    let dg_sender = Arc::new(Mutex::new(dg_sender));
+    let mut client_to_dg_count: u64 = 0;
+    let mut dg_to_client_count: u64 = 0;
 
-    // Message counters for logging
-    let dg_to_client_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let client_to_dg_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-    // Task 1: Forward messages from Deepgram to client
-    let client_sender_clone = client_sender.clone();
-    let dg_to_client_count_clone = dg_to_client_count.clone();
-    let dg_to_client = tokio::spawn(async move {
-        while let Some(msg) = dg_receiver.next().await {
-            match msg {
-                Ok(tungstenite::Message::Text(text)) => {
-                    let count = dg_to_client_count_clone
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        + 1;
-                    println!(
-                        "[deepgram->client] message #{} (binary: false, size: {})",
-                        count,
-                        text.len()
-                    );
-                    let mut sender = client_sender_clone.lock().await;
-                    if sender.send(Message::Text(text.to_string().into())).await.is_err() {
-                        eprintln!("[deepgram->client] write error");
-                        break;
+    // Single-task proxy loop: select over incoming client messages and
+    // Deepgram responses. The SDK handle is not splittable, so both
+    // directions share one task via `tokio::select!`.
+    loop {
+        tokio::select! {
+            client_msg = client_receiver.next() => {
+                match client_msg {
+                    Some(Ok(Message::Binary(data))) => {
+                        client_to_dg_count += 1;
+                        if client_to_dg_count % 10 == 0 {
+                            println!(
+                                "[client->deepgram] message #{} (binary: true, size: {})",
+                                client_to_dg_count,
+                                data.len()
+                            );
+                        }
+                        if dg_handle.send_data(data.to_vec()).await.is_err() {
+                            eprintln!("[client->deepgram] send error");
+                            break;
+                        }
                     }
-                }
-                Ok(tungstenite::Message::Binary(data)) => {
-                    let count = dg_to_client_count_clone
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        + 1;
-                    if count % 10 == 0 {
+                    Some(Ok(Message::Text(text))) => {
+                        client_to_dg_count += 1;
                         println!(
-                            "[deepgram->client] message #{} (binary: true, size: {})",
-                            count,
-                            data.len()
+                            "[client->deepgram] message #{} (binary: false, size: {})",
+                            client_to_dg_count,
+                            text.len()
                         );
+                        // Map known control messages onto the SDK handle.
+                        let text = text.to_string();
+                        let kind = serde_json::from_str::<serde_json::Value>(&text)
+                            .ok()
+                            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from));
+                        match kind.as_deref() {
+                            Some("KeepAlive") => {
+                                let _ = dg_handle.keep_alive().await;
+                            }
+                            Some("Finalize") => {
+                                let _ = dg_handle.finalize().await;
+                            }
+                            Some("CloseStream") => {
+                                let _ = dg_handle.close_stream().await;
+                                break;
+                            }
+                            _ => {
+                                // Unknown control message; nothing to forward.
+                            }
+                        }
                     }
-                    let mut sender = client_sender_clone.lock().await;
-                    if sender.send(Message::Binary(data.to_vec().into())).await.is_err() {
-                        eprintln!("[deepgram->client] write error");
+                    Some(Ok(Message::Close(_))) | None => {
+                        println!("[client->deepgram] client closed connection");
+                        break;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        eprintln!("[client->deepgram] read error: {e}");
                         break;
                     }
                 }
-                Ok(tungstenite::Message::Close(_)) => {
-                    println!("[deepgram->client] Deepgram closed connection");
-                    break;
-                }
-                Ok(tungstenite::Message::Ping(data)) => {
-                    let mut sender = client_sender_clone.lock().await;
-                    let _ = sender.send(Message::Ping(data.to_vec().into())).await;
-                }
-                Ok(tungstenite::Message::Pong(_)) => {}
-                Ok(tungstenite::Message::Frame(_)) => {}
-                Err(e) => {
-                    eprintln!("[deepgram->client] read error: {e}");
-                    break;
+            }
+            dg_msg = dg_handle.receive() => {
+                match dg_msg {
+                    Some(Ok(response)) => {
+                        dg_to_client_count += 1;
+                        match serde_json::to_string(&response) {
+                            Ok(json) => {
+                                if dg_to_client_count % 10 == 0 {
+                                    println!(
+                                        "[deepgram->client] message #{} (size: {})",
+                                        dg_to_client_count,
+                                        json.len()
+                                    );
+                                }
+                                let mut sender = client_sender.lock().await;
+                                if sender.send(Message::Text(json.into())).await.is_err() {
+                                    eprintln!("[deepgram->client] write error");
+                                    break;
+                                }
+                            }
+                            Err(e) => eprintln!("[deepgram->client] serialize error: {e}"),
+                        }
+                    }
+                    Some(Err(e)) => {
+                        eprintln!("[deepgram->client] Deepgram error: {e}");
+                        break;
+                    }
+                    None => {
+                        println!("[deepgram->client] Deepgram closed connection");
+                        break;
+                    }
                 }
             }
         }
-    });
-
-    // Task 2: Forward messages from client to Deepgram
-    let dg_sender_clone = dg_sender.clone();
-    let client_to_dg_count_clone = client_to_dg_count.clone();
-    let client_to_dg = tokio::spawn(async move {
-        while let Some(msg) = client_receiver.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    let count = client_to_dg_count_clone
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        + 1;
-                    println!(
-                        "[client->deepgram] message #{} (binary: false, size: {})",
-                        count,
-                        text.len()
-                    );
-                    let mut sender = dg_sender_clone.lock().await;
-                    if sender
-                        .send(tungstenite::Message::Text(text.to_string().into()))
-                        .await
-                        .is_err()
-                    {
-                        eprintln!("[client->deepgram] write error");
-                        break;
-                    }
-                }
-                Ok(Message::Binary(data)) => {
-                    let count = client_to_dg_count_clone
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        + 1;
-                    if count % 10 == 0 {
-                        println!(
-                            "[client->deepgram] message #{} (binary: true, size: {})",
-                            count,
-                            data.len()
-                        );
-                    }
-                    let mut sender = dg_sender_clone.lock().await;
-                    if sender
-                        .send(tungstenite::Message::Binary(data.to_vec().into()))
-                        .await
-                        .is_err()
-                    {
-                        eprintln!("[client->deepgram] write error");
-                        break;
-                    }
-                }
-                Ok(Message::Close(_)) => {
-                    println!("[client->deepgram] client closed connection");
-                    break;
-                }
-                Ok(Message::Ping(data)) => {
-                    let mut sender = dg_sender_clone.lock().await;
-                    let _ = sender
-                        .send(tungstenite::Message::Ping(data.to_vec().into()))
-                        .await;
-                }
-                Ok(Message::Pong(_)) => {}
-                Err(e) => {
-                    eprintln!("[client->deepgram] read error: {e}");
-                    break;
-                }
-            }
-        }
-    });
-
-    // Wait for either direction to finish (indicates one side closed)
-    tokio::select! {
-        _ = dg_to_client => {},
-        _ = client_to_dg => {},
     }
 
-    // Clean up: close both connections
+    // Clean up: close the Deepgram stream and the client connection.
     println!("Proxy session ending, closing connections");
-
-    {
-        let mut sender = client_sender.lock().await;
-        let _ = sender
-            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                code: 1000,
-                reason: "".into(),
-            })))
-            .await;
-    }
-
-    {
-        let mut sender = dg_sender.lock().await;
-        let _ = sender
-            .send(tungstenite::Message::Close(Some(
-                tungstenite::protocol::CloseFrame {
-                    code: tungstenite::protocol::frame::coding::CloseCode::Normal,
-                    reason: "Client disconnected".into(),
-                },
-            )))
-            .await;
-    }
+    let _ = dg_handle.close_stream().await;
+    close_client(&client_sender, 1000, "").await;
 
     // Remove from active connections
     remove_connection(&state, &client_sender).await;
+}
+
+/// Sends a close frame to the client connection, ignoring any send error.
+async fn close_client(
+    sender: &Arc<Mutex<SplitSink<WebSocket, Message>>>,
+    code: u16,
+    reason: &str,
+) {
+    let mut sender = sender.lock().await;
+    let _ = sender
+        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+            code,
+            reason: reason.into(),
+        })))
+        .await;
 }
 
 /// Removes a connection from the active connections list.

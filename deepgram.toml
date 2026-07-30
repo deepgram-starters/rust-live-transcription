@@ -6,7 +6,7 @@ repository = "https://github.com/deepgram-starters/rust-live-transcription"
 useCase = "live-transcription"
 language = "Rust"
 framework = "Axum"
-sdk = "N/A"
+sdk = "deepgram"
 tags = ["live-transcription", "live-stt", "real-time-transcription", "real-time-asr", "streaming-transcription", "live-speech-to-text", "rust", "axum"]
 
 [check]
