@@ -278,10 +278,16 @@ async fn handle_live_transcription(
 /// live-transcription [`WebsocketHandle`](deepgram::listen::websocket). Audio
 /// frames arriving from the browser are forwarded to Deepgram via
 /// `send_data`, JSON control messages are mapped onto the handle's
-/// `keep_alive` / `finalize` / `close_stream` helpers, and typed
-/// [`StreamResponse`](deepgram::common::stream_response::StreamResponse)
-/// results coming back from Deepgram are re-serialized to JSON and forwarded
-/// to the browser unchanged in shape.
+/// `keep_alive` / `finalize` / `close_stream` helpers, and responses coming
+/// back from Deepgram are decoded into the SDK's typed
+/// [`StreamResponse`](deepgram::common::stream_response::StreamResponse) and
+/// re-encoded as JSON before being forwarded to the browser.
+///
+/// Note this is a lossy round-trip, not a byte-for-shape passthrough:
+/// `StreamResponse` is a partial, `#[non_exhaustive]`, `#[serde(untagged)]`
+/// model (it only covers Results, Metadata, SpeechStarted and UtteranceEnd),
+/// so fields it does not model are dropped and message types it cannot decode
+/// are not preserved (see the receive loop below).
 async fn handle_ws_proxy(
     client_ws: WebSocket,
     state: Arc<AppState>,
@@ -457,6 +463,16 @@ async fn handle_ws_proxy(
                         }
                     }
                     Some(Err(e)) => {
+                        // Known limitation: because StreamResponse is a closed,
+                        // #[non_exhaustive] #[serde(untagged)] enum, a frame the
+                        // SDK can't decode surfaces here as Some(Err(..)) — the
+                        // same shape as a real transport error, which the opaque
+                        // DeepgramError does not let us distinguish. We treat
+                        // both as terminal and end the session. On the nova-3
+                        // happy path this does not fire (Results and the final
+                        // Metadata are both modeled); a newly added Deepgram
+                        // message type would end the session until the SDK models
+                        // it.
                         eprintln!("[deepgram->client] Deepgram error: {e}");
                         break;
                     }
