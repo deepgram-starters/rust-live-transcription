@@ -100,6 +100,7 @@ struct AppState {
 // ============================================================================
 
 const JWT_EXPIRY_SECS: i64 = 3600; // 1 hour
+const PROVIDER_ERROR_DESCRIPTION: &str = "Deepgram transcription request failed";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
@@ -118,6 +119,17 @@ fn issue_token(secret: &[u8]) -> Result<String, jsonwebtoken::errors::Error> {
         &Header::new(Algorithm::HS256),
         &claims,
         &EncodingKey::from_secret(secret),
+    )
+}
+
+fn provider_error_message() -> Message {
+    Message::Text(
+        serde_json::json!({
+            "type": "Error",
+            "description": PROVIDER_ERROR_DESCRIPTION,
+        })
+        .to_string()
+        .into(),
     )
 }
 
@@ -328,6 +340,10 @@ async fn handle_ws_proxy(
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
     let smart_format = params.get("smart_format").map(|s| s == "true").unwrap_or(true);
+    let interim_results = params
+        .get("interim_results")
+        .map(|s| s == "true")
+        .unwrap_or(true);
     let punctuate = params.get("punctuate").map(|s| s == "true").unwrap_or(true);
     let diarize = params.get("diarize").map(|s| s == "true").unwrap_or(false);
     let filler_words = params.get("filler_words").map(|s| s == "true").unwrap_or(false);
@@ -363,6 +379,7 @@ async fn handle_ws_proxy(
         .encoding(map_encoding(&encoding))
         .sample_rate(sample_rate)
         .channels(channels)
+        .interim_results(interim_results)
         .handle()
         .await
     {
@@ -422,7 +439,7 @@ async fn handle_ws_proxy(
                             }
                             Some("CloseStream") => {
                                 let _ = dg_handle.close_stream().await;
-                                break;
+                                // The browser remains open for final Results and Metadata.
                             }
                             _ => {
                                 // Unknown control message; nothing to forward.
@@ -463,17 +480,9 @@ async fn handle_ws_proxy(
                         }
                     }
                     Some(Err(e)) => {
-                        // Known limitation: because StreamResponse is a closed,
-                        // #[non_exhaustive] #[serde(untagged)] enum, a frame the
-                        // SDK can't decode surfaces here as Some(Err(..)) — the
-                        // same shape as a real transport error, which the opaque
-                        // DeepgramError does not let us distinguish. We treat
-                        // both as terminal and end the session. On the nova-3
-                        // happy path this does not fire (Results and the final
-                        // Metadata are both modeled); a newly added Deepgram
-                        // message type would end the session until the SDK models
-                        // it.
                         eprintln!("[deepgram->client] Deepgram error: {e}");
+                        let mut sender = client_sender.lock().await;
+                        let _ = sender.send(provider_error_message()).await;
                         break;
                     }
                     None => {
@@ -619,4 +628,21 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal(state))
         .await
         .expect("Server failed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{provider_error_message, PROVIDER_ERROR_DESCRIPTION};
+    use axum::extract::ws::Message;
+
+    #[test]
+    fn provider_errors_use_the_browser_contract() {
+        let Message::Text(message) = provider_error_message() else {
+            panic!("expected a text WebSocket frame");
+        };
+        let frame: serde_json::Value = serde_json::from_str(&message.to_string()).unwrap();
+
+        assert_eq!(frame["type"], "Error");
+        assert_eq!(frame["description"], PROVIDER_ERROR_DESCRIPTION);
+    }
 }
