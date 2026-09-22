@@ -10,26 +10,25 @@
  *   GET  /api/metadata             - Project metadata from deepgram.toml
  *   GET  /health                   - Health check
  */
-
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Json};
 use axum::routing::get;
-use axum::Router;
 use chrono::Utc;
 use deepgram::{
-    common::options::{Encoding, Language, Model, Options},
     Deepgram,
+    common::options::{Encoding, Language, Model, Options},
 };
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -79,11 +78,32 @@ fn load_config() -> Config {
 
     Config {
         deepgram_api_key: api_key,
-        deepgram_base_url: env::var("DEEPGRAM_BASE_URL").ok(),
+        deepgram_base_url: load_deepgram_base_url(),
         port,
         host,
         session_secret: secret,
     }
+}
+
+fn load_deepgram_base_url() -> Option<String> {
+    let base_url = env::var("DEEPGRAM_BASE_URL").ok()?;
+    let allows_insecure = env::var("DEEPGRAM_ALLOW_INSECURE_BASE_URL").as_deref() == Ok("1");
+
+    if !is_allowed_deepgram_base_url(&base_url, allows_insecure) {
+        eprintln!(
+            "ERROR: DEEPGRAM_BASE_URL must use https:// or wss://. Set \
+             DEEPGRAM_ALLOW_INSECURE_BASE_URL=1 only for a local test endpoint."
+        );
+        std::process::exit(1);
+    }
+
+    Some(base_url)
+}
+
+fn is_allowed_deepgram_base_url(base_url: &str, allows_insecure: bool) -> bool {
+    base_url.starts_with("https://")
+        || base_url.starts_with("wss://")
+        || (allows_insecure && (base_url.starts_with("http://") || base_url.starts_with("ws://")))
 }
 
 // ============================================================================
@@ -124,15 +144,24 @@ fn issue_token(secret: &[u8]) -> Result<String, jsonwebtoken::errors::Error> {
     )
 }
 
-fn provider_error_message() -> Message {
+fn provider_error_message(description: &str) -> Message {
     Message::Text(
         serde_json::json!({
             "type": "Error",
-            "description": PROVIDER_ERROR_DESCRIPTION,
+            "description": description,
         })
         .to_string()
         .into(),
     )
+}
+
+fn provider_error_description(error: &deepgram::DeepgramError) -> String {
+    match error {
+        deepgram::DeepgramError::WebsocketClose { reason, .. } if !reason.is_empty() => {
+            reason.clone()
+        }
+        _ => PROVIDER_ERROR_DESCRIPTION.to_string(),
+    }
 }
 
 /// Verifies a JWT token string and returns an error if invalid.
@@ -168,8 +197,8 @@ struct TomlConfig {
 
 /// Reads and parses the [meta] section from deepgram.toml.
 fn load_metadata() -> Result<serde_json::Value, String> {
-    let content =
-        std::fs::read_to_string("deepgram.toml").map_err(|e| format!("Failed to read deepgram.toml: {e}"))?;
+    let content = std::fs::read_to_string("deepgram.toml")
+        .map_err(|e| format!("Failed to read deepgram.toml: {e}"))?;
     let config: TomlConfig =
         toml::from_str(&content).map_err(|e| format!("Failed to parse deepgram.toml: {e}"))?;
     let meta = config
@@ -341,14 +370,20 @@ async fn handle_ws_proxy(
         .get("channels")
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
-    let smart_format = params.get("smart_format").map(|s| s == "true").unwrap_or(true);
+    let smart_format = params
+        .get("smart_format")
+        .map(|s| s == "true")
+        .unwrap_or(true);
     let interim_results = params
         .get("interim_results")
         .map(|s| s == "true")
-        .unwrap_or(true);
+        .unwrap_or(false);
     let punctuate = params.get("punctuate").map(|s| s == "true").unwrap_or(true);
     let diarize = params.get("diarize").map(|s| s == "true").unwrap_or(false);
-    let filler_words = params.get("filler_words").map(|s| s == "true").unwrap_or(false);
+    let filler_words = params
+        .get("filler_words")
+        .map(|s| s == "true")
+        .unwrap_or(false);
 
     println!(
         "Connecting to Deepgram STT: model={}, language={}, encoding={}, sample_rate={}, channels={}",
@@ -366,7 +401,9 @@ async fn handle_ws_proxy(
 
     // Establish the Deepgram live-transcription websocket via the SDK.
     let deepgram_client = match state.config.deepgram_base_url.as_deref() {
-        Some(base_url) => Deepgram::with_base_url_and_api_key(base_url, &state.config.deepgram_api_key),
+        Some(base_url) => {
+            Deepgram::with_base_url_and_api_key(base_url, &state.config.deepgram_api_key)
+        }
         None => Deepgram::new(&state.config.deepgram_api_key),
     };
     let dg = match deepgram_client {
@@ -488,7 +525,9 @@ async fn handle_ws_proxy(
                     Some(Err(e)) => {
                         eprintln!("[deepgram->client] Deepgram error: {e}");
                         let mut sender = client_sender.lock().await;
-                        let _ = sender.send(provider_error_message()).await;
+                        let _ = sender
+                            .send(provider_error_message(&provider_error_description(&e)))
+                            .await;
                         break;
                     }
                     None => {
@@ -510,11 +549,7 @@ async fn handle_ws_proxy(
 }
 
 /// Sends a close frame to the client connection, ignoring any send error.
-async fn close_client(
-    sender: &Arc<Mutex<SplitSink<WebSocket, Message>>>,
-    code: u16,
-    reason: &str,
-) {
+async fn close_client(sender: &Arc<Mutex<SplitSink<WebSocket, Message>>>, code: u16, reason: &str) {
     let mut sender = sender.lock().await;
     let _ = sender
         .send(Message::Close(Some(axum::extract::ws::CloseFrame {
@@ -620,7 +655,10 @@ async fn main() {
 
     println!();
     println!("{}", "=".repeat(70));
-    println!("Backend API Server running at http://localhost:{}", addr.port());
+    println!(
+        "Backend API Server running at http://localhost:{}",
+        addr.port()
+    );
     println!();
     println!("  GET  /api/session");
     println!("  WS   /api/live-transcription (auth required)");
@@ -651,8 +689,8 @@ mod tests {
     use tokio::task::JoinHandle;
     use tokio::time::timeout;
     use tokio_tungstenite::connect_async;
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     #[derive(Clone)]
     struct UpstreamState {
@@ -673,7 +711,9 @@ mod tests {
         Query(query): Query<HashMap<String, String>>,
         ws: WebSocketUpgrade,
     ) -> impl IntoResponse {
-        let send_error = query.get("interim_results").is_some_and(|value| value == "false");
+        let send_error = query
+            .get("interim_results")
+            .is_some_and(|value| value == "true");
         let _ = state.queries.send(query);
         let mut response = ws
             .on_upgrade(move |mut socket| async move {
@@ -749,7 +789,8 @@ mod tests {
         app_addr: SocketAddr,
         token: &str,
         query: &str,
-    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
         let mut request = format!("ws://{app_addr}/api/live-transcription{query}")
             .into_client_request()
             .unwrap();
@@ -762,13 +803,29 @@ mod tests {
 
     #[test]
     fn provider_errors_use_the_browser_contract() {
-        let AxumMessage::Text(message) = provider_error_message() else {
+        let AxumMessage::Text(message) = provider_error_message("provider rejected the stream")
+        else {
             panic!("expected a text WebSocket frame");
         };
         let frame: serde_json::Value = serde_json::from_str(&message.to_string()).unwrap();
 
         assert_eq!(frame["type"], "Error");
-        assert_eq!(frame["description"], PROVIDER_ERROR_DESCRIPTION);
+        assert_eq!(frame["description"], "provider rejected the stream");
+    }
+
+    #[test]
+    fn custom_base_urls_require_tls_unless_explicitly_local() {
+        assert!(is_allowed_deepgram_base_url(
+            "https://staging.example",
+            false
+        ));
+        assert!(is_allowed_deepgram_base_url("wss://staging.example", false));
+        assert!(!is_allowed_deepgram_base_url(
+            "http://127.0.0.1:8080",
+            false
+        ));
+        assert!(is_allowed_deepgram_base_url("http://127.0.0.1:8080", true));
+        assert!(!is_allowed_deepgram_base_url("ftp://example.com", true));
     }
 
     #[tokio::test]
@@ -797,7 +854,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(default_query.get("interim_results").map(String::as_str), Some("true"));
+        assert_eq!(
+            default_query.get("interim_results").map(String::as_str),
+            Some("false")
+        );
 
         default_browser
             .send(ClientMessage::Text(r#"{"type":"CloseStream"}"#.into()))
@@ -822,14 +882,21 @@ mod tests {
             .map(|message| serde_json::from_str::<serde_json::Value>(&message).unwrap())
             .collect::<Vec<_>>();
         assert!(messages.iter().any(|message| message["type"] == "Results"));
-        assert!(messages.iter().any(|message| message["request_id"] == "00000000-0000-0000-0000-000000000000"));
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["request_id"] == "00000000-0000-0000-0000-000000000000")
+        );
 
-        let mut error_browser = connect_browser(app_addr, &token, "?interim_results=false").await;
+        let mut error_browser = connect_browser(app_addr, &token, "?interim_results=true").await;
         let error_query = timeout(Duration::from_secs(2), query_rx.recv())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(error_query.get("interim_results").map(String::as_str), Some("false"));
+        assert_eq!(
+            error_query.get("interim_results").map(String::as_str),
+            Some("true")
+        );
         let error = timeout(Duration::from_secs(2), error_browser.next())
             .await
             .unwrap()
