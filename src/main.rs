@@ -10,26 +10,25 @@
  *   GET  /api/metadata             - Project metadata from deepgram.toml
  *   GET  /health                   - Health check
  */
-
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Json};
 use axum::routing::get;
-use axum::Router;
 use chrono::Utc;
 use deepgram::{
-    common::options::{Encoding, Language, Model, Options},
     Deepgram,
+    common::options::{Encoding, Language, Model, Options},
 };
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -43,6 +42,7 @@ use tower_http::cors::{Any, CorsLayer};
 #[derive(Clone)]
 struct Config {
     deepgram_api_key: String,
+    deepgram_base_url: Option<String>,
     port: u16,
     host: String,
     session_secret: Vec<u8>,
@@ -78,10 +78,32 @@ fn load_config() -> Config {
 
     Config {
         deepgram_api_key: api_key,
+        deepgram_base_url: load_deepgram_base_url(),
         port,
         host,
         session_secret: secret,
     }
+}
+
+fn load_deepgram_base_url() -> Option<String> {
+    let base_url = env::var("DEEPGRAM_BASE_URL").ok()?;
+    let allows_insecure = env::var("DEEPGRAM_ALLOW_INSECURE_BASE_URL").as_deref() == Ok("1");
+
+    if !is_allowed_deepgram_base_url(&base_url, allows_insecure) {
+        eprintln!(
+            "ERROR: DEEPGRAM_BASE_URL must use https:// or wss://. Set \
+             DEEPGRAM_ALLOW_INSECURE_BASE_URL=1 only for a local test endpoint."
+        );
+        std::process::exit(1);
+    }
+
+    Some(base_url)
+}
+
+fn is_allowed_deepgram_base_url(base_url: &str, allows_insecure: bool) -> bool {
+    base_url.starts_with("https://")
+        || base_url.starts_with("wss://")
+        || (allows_insecure && (base_url.starts_with("http://") || base_url.starts_with("ws://")))
 }
 
 // ============================================================================
@@ -100,6 +122,7 @@ struct AppState {
 // ============================================================================
 
 const JWT_EXPIRY_SECS: i64 = 3600; // 1 hour
+const PROVIDER_ERROR_DESCRIPTION: &str = "Deepgram transcription request failed";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
@@ -119,6 +142,26 @@ fn issue_token(secret: &[u8]) -> Result<String, jsonwebtoken::errors::Error> {
         &claims,
         &EncodingKey::from_secret(secret),
     )
+}
+
+fn provider_error_message(description: &str) -> Message {
+    Message::Text(
+        serde_json::json!({
+            "type": "Error",
+            "description": description,
+        })
+        .to_string()
+        .into(),
+    )
+}
+
+fn provider_error_description(error: &deepgram::DeepgramError) -> String {
+    match error {
+        deepgram::DeepgramError::WebsocketClose { reason, .. } if !reason.is_empty() => {
+            reason.clone()
+        }
+        _ => PROVIDER_ERROR_DESCRIPTION.to_string(),
+    }
 }
 
 /// Verifies a JWT token string and returns an error if invalid.
@@ -154,8 +197,8 @@ struct TomlConfig {
 
 /// Reads and parses the [meta] section from deepgram.toml.
 fn load_metadata() -> Result<serde_json::Value, String> {
-    let content =
-        std::fs::read_to_string("deepgram.toml").map_err(|e| format!("Failed to read deepgram.toml: {e}"))?;
+    let content = std::fs::read_to_string("deepgram.toml")
+        .map_err(|e| format!("Failed to read deepgram.toml: {e}"))?;
     let config: TomlConfig =
         toml::from_str(&content).map_err(|e| format!("Failed to parse deepgram.toml: {e}"))?;
     let meta = config
@@ -327,10 +370,20 @@ async fn handle_ws_proxy(
         .get("channels")
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
-    let smart_format = params.get("smart_format").map(|s| s == "true").unwrap_or(true);
+    let smart_format = params
+        .get("smart_format")
+        .map(|s| s == "true")
+        .unwrap_or(true);
+    let interim_results = params
+        .get("interim_results")
+        .map(|s| s == "true")
+        .unwrap_or(false);
     let punctuate = params.get("punctuate").map(|s| s == "true").unwrap_or(true);
     let diarize = params.get("diarize").map(|s| s == "true").unwrap_or(false);
-    let filler_words = params.get("filler_words").map(|s| s == "true").unwrap_or(false);
+    let filler_words = params
+        .get("filler_words")
+        .map(|s| s == "true")
+        .unwrap_or(false);
 
     println!(
         "Connecting to Deepgram STT: model={}, language={}, encoding={}, sample_rate={}, channels={}",
@@ -347,7 +400,13 @@ async fn handle_ws_proxy(
         .build();
 
     // Establish the Deepgram live-transcription websocket via the SDK.
-    let dg = match Deepgram::new(&state.config.deepgram_api_key) {
+    let deepgram_client = match state.config.deepgram_base_url.as_deref() {
+        Some(base_url) => {
+            Deepgram::with_base_url_and_api_key(base_url, &state.config.deepgram_api_key)
+        }
+        None => Deepgram::new(&state.config.deepgram_api_key),
+    };
+    let dg = match deepgram_client {
         Ok(dg) => dg,
         Err(e) => {
             eprintln!("Failed to initialize Deepgram client: {e}");
@@ -363,6 +422,7 @@ async fn handle_ws_proxy(
         .encoding(map_encoding(&encoding))
         .sample_rate(sample_rate)
         .channels(channels)
+        .interim_results(interim_results)
         .handle()
         .await
     {
@@ -422,7 +482,7 @@ async fn handle_ws_proxy(
                             }
                             Some("CloseStream") => {
                                 let _ = dg_handle.close_stream().await;
-                                break;
+                                // The browser remains open for final Results and Metadata.
                             }
                             _ => {
                                 // Unknown control message; nothing to forward.
@@ -463,17 +523,11 @@ async fn handle_ws_proxy(
                         }
                     }
                     Some(Err(e)) => {
-                        // Known limitation: because StreamResponse is a closed,
-                        // #[non_exhaustive] #[serde(untagged)] enum, a frame the
-                        // SDK can't decode surfaces here as Some(Err(..)) — the
-                        // same shape as a real transport error, which the opaque
-                        // DeepgramError does not let us distinguish. We treat
-                        // both as terminal and end the session. On the nova-3
-                        // happy path this does not fire (Results and the final
-                        // Metadata are both modeled); a newly added Deepgram
-                        // message type would end the session until the SDK models
-                        // it.
                         eprintln!("[deepgram->client] Deepgram error: {e}");
+                        let mut sender = client_sender.lock().await;
+                        let _ = sender
+                            .send(provider_error_message(&provider_error_description(&e)))
+                            .await;
                         break;
                     }
                     None => {
@@ -495,11 +549,7 @@ async fn handle_ws_proxy(
 }
 
 /// Sends a close frame to the client connection, ignoring any send error.
-async fn close_client(
-    sender: &Arc<Mutex<SplitSink<WebSocket, Message>>>,
-    code: u16,
-    reason: &str,
-) {
+async fn close_client(sender: &Arc<Mutex<SplitSink<WebSocket, Message>>>, code: u16, reason: &str) {
     let mut sender = sender.lock().await;
     let _ = sender
         .send(Message::Close(Some(axum::extract::ws::CloseFrame {
@@ -567,6 +617,21 @@ async fn shutdown_signal(state: Arc<AppState>) {
 // MAIN
 // ============================================================================
 
+fn app_router(state: Arc<AppState>) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    Router::new()
+        .route("/api/session", get(handle_session))
+        .route("/api/metadata", get(handle_metadata))
+        .route("/api/live-transcription", get(handle_live_transcription))
+        .route("/health", get(handle_health))
+        .layer(cors)
+        .with_state(state)
+}
+
 #[tokio::main]
 async fn main() {
     let config = load_config();
@@ -581,20 +646,7 @@ async fn main() {
         active_connections: Mutex::new(Vec::new()),
     });
 
-    // CORS middleware
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
-    // Build the Axum router
-    let app = Router::new()
-        .route("/api/session", get(handle_session))
-        .route("/api/metadata", get(handle_metadata))
-        .route("/api/live-transcription", get(handle_live_transcription))
-        .route("/health", get(handle_health))
-        .layer(cors)
-        .with_state(state.clone());
+    let app = app_router(state.clone());
 
     // Bind to the address
     let listener = TcpListener::bind(addr)
@@ -603,7 +655,10 @@ async fn main() {
 
     println!();
     println!("{}", "=".repeat(70));
-    println!("Backend API Server running at http://localhost:{}", addr.port());
+    println!(
+        "Backend API Server running at http://localhost:{}",
+        addr.port()
+    );
     println!();
     println!("  GET  /api/session");
     println!("  WS   /api/live-transcription (auth required)");
@@ -619,4 +674,243 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal(state))
         .await
         .expect("Server failed");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::*;
+    use axum::extract::ws::Message as AxumMessage;
+    use axum::response::IntoResponse;
+    use tokio::sync::mpsc;
+    use tokio::task::JoinHandle;
+    use tokio::time::timeout;
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::Message as ClientMessage;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    #[derive(Clone)]
+    struct UpstreamState {
+        queries: mpsc::UnboundedSender<HashMap<String, String>>,
+    }
+
+    async fn spawn_app(app: Router) -> (SocketAddr, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (addr, task)
+    }
+
+    async fn mock_deepgram(
+        State(state): State<UpstreamState>,
+        Query(query): Query<HashMap<String, String>>,
+        ws: WebSocketUpgrade,
+    ) -> impl IntoResponse {
+        let send_error = query
+            .get("interim_results")
+            .is_some_and(|value| value == "true");
+        let _ = state.queries.send(query);
+        let mut response = ws
+            .on_upgrade(move |mut socket| async move {
+                if send_error {
+                    let _ = socket
+                        .send(AxumMessage::Text(
+                            serde_json::json!({
+                                "type": "Error",
+                                "description": "provider rejected the stream",
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await;
+                    return;
+                }
+
+                while let Some(Ok(AxumMessage::Text(message))) = socket.next().await {
+                    if message.contains("CloseStream") {
+                        let _ = socket
+                            .send(AxumMessage::Text(
+                                serde_json::json!({
+                                    "type": "Results",
+                                    "start": 0.0,
+                                    "duration": 0.0,
+                                    "is_final": true,
+                                    "speech_final": true,
+                                    "from_finalize": true,
+                                    "channel": {
+                                        "alternatives": [{
+                                            "transcript": "final words",
+                                            "words": [],
+                                            "confidence": 1.0,
+                                            "languages": [],
+                                        }],
+                                    },
+                                    "metadata": {
+                                        "request_id": "00000000-0000-0000-0000-000000000000",
+                                        "model_info": { "name": "nova-3", "version": "1", "arch": "test" },
+                                        "model_uuid": "test",
+                                    },
+                                    "channel_index": [0, 1],
+                                })
+                                .to_string()
+                                .into(),
+                            ))
+                            .await;
+                        let _ = socket
+                            .send(AxumMessage::Text(
+                                serde_json::json!({
+                                    "request_id": "00000000-0000-0000-0000-000000000000",
+                                    "created": "2026-09-21T00:00:00Z",
+                                    "duration": 0.0,
+                                    "channels": 1,
+                                })
+                                .to_string()
+                                .into(),
+                            ))
+                            .await;
+                        return;
+                    }
+                }
+            })
+            .into_response();
+        response.headers_mut().insert(
+            "dg-request-id",
+            HeaderValue::from_static("00000000-0000-0000-0000-000000000000"),
+        );
+        response
+    }
+
+    async fn connect_browser(
+        app_addr: SocketAddr,
+        token: &str,
+        query: &str,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        let mut request = format!("ws://{app_addr}/api/live-transcription{query}")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            format!("access_token.{token}").parse().unwrap(),
+        );
+        connect_async(request).await.unwrap().0
+    }
+
+    #[test]
+    fn provider_errors_use_the_browser_contract() {
+        let AxumMessage::Text(message) = provider_error_message("provider rejected the stream")
+        else {
+            panic!("expected a text WebSocket frame");
+        };
+        let frame: serde_json::Value = serde_json::from_str(&message.to_string()).unwrap();
+
+        assert_eq!(frame["type"], "Error");
+        assert_eq!(frame["description"], "provider rejected the stream");
+    }
+
+    #[test]
+    fn custom_base_urls_require_tls_unless_explicitly_local() {
+        assert!(is_allowed_deepgram_base_url(
+            "https://staging.example",
+            false
+        ));
+        assert!(is_allowed_deepgram_base_url("wss://staging.example", false));
+        assert!(!is_allowed_deepgram_base_url(
+            "http://127.0.0.1:8080",
+            false
+        ));
+        assert!(is_allowed_deepgram_base_url("http://127.0.0.1:8080", true));
+        assert!(!is_allowed_deepgram_base_url("ftp://example.com", true));
+    }
+
+    #[tokio::test]
+    async fn proxy_forwards_streaming_controls_and_provider_errors() {
+        let (query_tx, mut query_rx) = mpsc::unbounded_channel();
+        let upstream = Router::new()
+            .route("/v1/listen", get(mock_deepgram))
+            .with_state(UpstreamState { queries: query_tx });
+        let (upstream_addr, upstream_task) = spawn_app(upstream).await;
+
+        let state = Arc::new(AppState {
+            config: Config {
+                deepgram_api_key: "test-key".to_string(),
+                deepgram_base_url: Some(format!("http://{upstream_addr}")),
+                port: 0,
+                host: "127.0.0.1".to_string(),
+                session_secret: vec![1; 32],
+            },
+            active_connections: Mutex::new(Vec::new()),
+        });
+        let token = issue_token(&state.config.session_secret).unwrap();
+        let (app_addr, app_task) = spawn_app(app_router(state)).await;
+
+        let mut default_browser = connect_browser(app_addr, &token, "").await;
+        let default_query = timeout(Duration::from_secs(2), query_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            default_query.get("interim_results").map(String::as_str),
+            Some("false")
+        );
+
+        default_browser
+            .send(ClientMessage::Text(r#"{"type":"CloseStream"}"#.into()))
+            .await
+            .unwrap();
+        let first = timeout(Duration::from_secs(2), default_browser.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
+        let second = timeout(Duration::from_secs(2), default_browser.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
+        let messages = [first, second]
+            .into_iter()
+            .map(|message| serde_json::from_str::<serde_json::Value>(&message).unwrap())
+            .collect::<Vec<_>>();
+        assert!(messages.iter().any(|message| message["type"] == "Results"));
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["request_id"] == "00000000-0000-0000-0000-000000000000")
+        );
+
+        let mut error_browser = connect_browser(app_addr, &token, "?interim_results=true").await;
+        let error_query = timeout(Duration::from_secs(2), query_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            error_query.get("interim_results").map(String::as_str),
+            Some("true")
+        );
+        let error = timeout(Duration::from_secs(2), error_browser.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(error["type"], "Error");
+        assert_eq!(error["description"], PROVIDER_ERROR_DESCRIPTION);
+
+        let _ = default_browser.close(None).await;
+        let _ = error_browser.close(None).await;
+        app_task.abort();
+        upstream_task.abort();
+    }
 }

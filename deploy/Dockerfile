@@ -1,8 +1,8 @@
 # Stage 1: Build custom Caddy with rate limiting module
-FROM golang:1.23-alpine AS caddy-builder
+FROM golang:1.25-alpine AS caddy-builder
 WORKDIR /build
-RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
-RUN xcaddy build --with github.com/mholt/caddy-ratelimit
+RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.5
+RUN xcaddy build v2.10.2 --with github.com/mholt/caddy-ratelimit@v0.1.0
 # Binary output: /build/caddy
 
 # Stage 2: Build frontend
@@ -17,7 +17,7 @@ RUN cd frontend && pnpm build
 RUN sed -i 's|<head>|<head>\n  <base href="{{ .Req.Header.Get "X-Base-Path" }}">|' ./frontend/dist/index.html
 
 # Stage 3: Build Rust backend
-FROM rust:1.84-slim AS rust-builder
+FROM rust:1.88-slim AS rust-builder
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./

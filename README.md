@@ -20,6 +20,13 @@ make start
 
 Open [http://localhost:8080](http://localhost:8080) in your browser.
 
+## Custom Endpoint
+
+`DEEPGRAM_BASE_URL` can point the starter at a Deepgram-compatible endpoint. It
+must use `https://` or `wss://` so the API key remains encrypted in transit.
+For a local test endpoint only, set `DEEPGRAM_ALLOW_INSECURE_BASE_URL=1` with
+an `http://` or `ws://` URL. Never use that override outside local testing.
+
 ## License
 
 MIT - See [LICENSE](./LICENSE)
